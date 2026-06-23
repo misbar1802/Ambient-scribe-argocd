@@ -50,7 +50,7 @@ server:
     name: argocd-server
 
 controller:
-  replicas: 2
+  replicas: 1
   serviceAccount:
     create: true
     name: argocd-application-controller
