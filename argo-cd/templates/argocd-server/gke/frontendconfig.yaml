@@ -1,0 +1,21 @@
+{{- if and .Values.server.ingress.enabled (eq .Values.server.ingress.controller "gke") .Values.server.ingress.gke.frontendConfig }}
+apiVersion: networking.gke.io/v1beta1
+kind: FrontendConfig
+metadata:
+  name: {{ include "argo-cd.server.fullname" . }}
+  namespace: {{ include  "argo-cd.namespace" . }}
+  labels:
+    {{- include "argo-cd.labels" (dict "context" . "component" .Values.server.name "name" .Values.server.name) | nindent 4 }}
+  # GKE's FrontendConfig CRD OpenAPI schema only declares sslPolicy and
+  # redirectToHttps; allowGlobalAccess is processed by the GKE Ingress
+  # controller but missing from the CRD schema. Argo CD ServerSideApply
+  # (structured-merge-diff) rejects fields not in the schema with
+  # ".spec.allowGlobalAccess: field not declared in schema". Force
+  # client-side apply for this resource so the field passes through.
+  annotations:
+    argocd.argoproj.io/sync-options: ServerSideApply=false
+{{- with .Values.server.ingress.gke.frontendConfig }}
+spec:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}

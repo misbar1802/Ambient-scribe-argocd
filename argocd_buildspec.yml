@@ -1,0 +1,154 @@
+version: 0.2
+
+# ─────────────────────────────────────────────────────────────
+# ArgoCD Helm Deployment Buildspec
+# Triggered by changes under: argo-cd/**
+# Target cluster : thunai-dev (EKS, us-east-1)
+# Helm chart     : ./argo-cd  (argo-cd v3.3.6 / chart 9.4.17)
+# Values override: ./argo-cd/thunai-values.yaml
+# Namespace      : argocd
+# ─────────────────────────────────────────────────────────────
+
+env:
+  variables:
+    SERVICE_NAME: "Thunai Mediscribe ArgoCD"
+    AWS_REGION: "us-east-1"
+    EKS_CLUSTER_NAME: "Ambinent-scribe-dev"
+    HELM_RELEASE_NAME: "argocd"
+    HELM_CHART_PATH: "./argo-cd"
+    HELM_VALUES_FILE: "./argo-cd/thunai-values.yaml"
+    NAMESPACE: "argocd"
+    AWS_ACCOUNT_ID: "253490767737"
+  secrets-manager:
+    SLACK_WEBHOOK_URL: "/ambient/slack/webhook-url:/ambient/slack/webhook-url"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "Installing dependencies..."
+      - yum install -y git tar
+
+      # Install kubectl
+      - echo "Installing kubectl..."
+      - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+      - chmod +x kubectl
+      - mv kubectl /usr/local/bin/kubectl
+      - kubectl version --client
+
+      # Install Helm
+      - echo "Installing Helm..."
+      - curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      - helm version
+
+  pre_build:
+    commands:
+      # Notify Slack - Deployment Started
+      - echo "Notifying Slack - ArgoCD Deployment Started..."
+      - |
+        if [ -n "$SLACK_WEBHOOK_URL" ]; then
+          COMMITTER_EMAIL=$(git log -1 --pretty=format:'%ae' 2>/dev/null || echo "${CODEBUILD_INITIATOR:-Unknown}")
+          MERGER_EMAIL=$(git log -1 --pretty=format:'%ce' 2>/dev/null || echo "${CODEBUILD_INITIATOR:-Unknown}")
+          curl --location "$SLACK_WEBHOOK_URL" --header 'Content-type: application/json' \
+            --data "{\"text\":\"🔧 *$SERVICE_NAME Deployment Started*: 👤 $COMMITTER_EMAIL Merged by: $MERGER_EMAIL\"}" || true
+        else
+          echo "SLACK_WEBHOOK_URL not set, skipping Slack notification"
+        fi
+
+      # Configure kubectl for EKS
+      - echo "Setting up EKS credentials..."
+      - aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
+
+      # Ensure the argocd namespace exists
+      - echo "Ensuring namespace '$NAMESPACE' exists..."
+      - kubectl get namespace $NAMESPACE || kubectl create namespace $NAMESPACE
+
+      # Update Helm dependencies (fetches the redis-ha sub-chart lock)
+      - echo "Updating Helm chart dependencies..."
+      - helm dependency update $HELM_CHART_PATH
+
+      # Lint the chart with the override values
+      - echo "Linting Helm chart..."
+      - |
+        if ! helm lint $HELM_CHART_PATH -f $HELM_VALUES_FILE; then
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            curl --location "$SLACK_WEBHOOK_URL" --header 'Content-type: application/json' \
+              --data "{\"text\":\"❌ *$SERVICE_NAME Helm Lint Failed* <https://$AWS_REGION.console.aws.amazon.com/codesuite/codebuild/$AWS_ACCOUNT_ID/projects/$CODEBUILD_BUILD_ID|View Build Logs>\"}" || true
+          fi
+          exit 1
+        fi
+
+  build:
+    commands:
+      # Dry-run to validate the rendered manifests before applying
+      - echo "Running Helm dry-run..."
+      - |
+        if ! helm upgrade --install $HELM_RELEASE_NAME $HELM_CHART_PATH \
+            --namespace $NAMESPACE \
+            -f $HELM_VALUES_FILE \
+            --dry-run; then
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            curl --location "$SLACK_WEBHOOK_URL" --header 'Content-type: application/json' \
+              --data "{\"text\":\"❌ *$SERVICE_NAME Helm Dry-Run Failed* <https://$AWS_REGION.console.aws.amazon.com/codesuite/codebuild/$AWS_ACCOUNT_ID/projects/$CODEBUILD_BUILD_ID|View Build Logs>\"}" || true
+          fi
+          exit 1
+        fi
+
+      # Apply the Helm chart (upgrade or install)
+      - echo "Deploying ArgoCD via Helm..."
+      - |
+        helm upgrade --install $HELM_RELEASE_NAME $HELM_CHART_PATH \
+          --namespace $NAMESPACE \
+          -f $HELM_VALUES_FILE \
+          --wait \
+          --timeout 10m \
+          --atomic
+
+      # Apply the ArgoCD self-managing Application manifest
+      - echo "Waiting for ArgoCD CRDs to be established..."
+      - kubectl wait --for condition=established --timeout=60s crd/applications.argoproj.io || sleep 10
+      - echo "Applying ArgoCD self-managing Application manifest..."
+      - kubectl apply -f argocd-app.yml -n argocd
+
+  post_build:
+    commands:
+      # Check build status and notify Slack
+      - echo "Checking deployment status..."
+      - |
+        if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
+          echo "Notifying Slack - Deployment Succeeded..."
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            curl --location "$SLACK_WEBHOOK_URL" --header 'Content-type: application/json' \
+              --data "{\"text\":\"✅ *$SERVICE_NAME Deployment Succeeded* — ArgoCD is live at https://argocd-dev.thunai.ai\"}" || true
+          else
+            echo "SLACK_WEBHOOK_URL not set, skipping Slack notification"
+          fi
+        else
+          echo "Notifying Slack - Deployment Failed..."
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            curl --location "$SLACK_WEBHOOK_URL" --header 'Content-type: application/json' \
+              --data "{\"text\":\"❌ *$SERVICE_NAME Deployment Failed* <https://$AWS_REGION.console.aws.amazon.com/codesuite/codebuild/$AWS_ACCOUNT_ID/projects/$CODEBUILD_BUILD_ID|View Build Logs>\"}" || true
+          fi
+          exit 1
+        fi
+
+      # Show Helm release status for audit trail in build logs
+      - echo "Helm release status..."
+      - helm status $HELM_RELEASE_NAME --namespace $NAMESPACE || true
+
+      # Show ArgoCD pods health
+      - echo "ArgoCD pod status..."
+      - kubectl get pods -n $NAMESPACE || true
+
+# Artifacts — captures the rendered values for audit purposes
+artifacts:
+  files:
+    - 'argo-cd/thunai-values.yaml'
+    - 'argo-cd/Chart.yaml'
+    - 'argo-cd/Chart.lock'
+
+# Cache — nothing pip-specific here, but keep pattern consistent
+cache:
+  paths:
+    - '/root/.cache/helm/**/*'
